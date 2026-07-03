@@ -37,6 +37,13 @@
 #include <hal/nrf_spu.h>
 #include <hal/nrf_mpc.h>
 #include <hal/nrf_lfxo.h>
+/* nrfx_mramc.h inline functions reference NRF_MRAMC which is only defined in
+* the secure context.  Do not include for non-secure (NS) builds.
+*/
+#if !defined(CONFIG_TRUSTED_EXECUTION_NONSECURE) || defined(__NRF_TFM__)
+#include <zephyr/sys/sys_io.h>
+#include <nrfx_mramc.h>
+#endif
 
 LOG_MODULE_REGISTER(soc, CONFIG_SOC_LOG_LEVEL);
 
@@ -95,18 +102,20 @@ struct mpc_region_override {
 
 static const struct mpc_region_override mpc00_region_overrides[] = {
 	/* Make RAM_00/01/02 (AMBIX00 + AMBIX03) accessible to all domains */
-	MPC_REGION_OVERRIDE_INIT(0x20000000, 0x200E0000, 0, 0),
+	MPC_REGION_OVERRIDE_INIT(0x20000000, 0x200FE000, 0, 0),
 	/* Make MRAM accessible to all domains */
 	MPC_REGION_OVERRIDE_INIT(0x00000000, 0x01000000, 0, 0),
 #if CONFIG_SOC_NRF71_WIFI_DAP
 	/* Allow access to Wi-Fi debug interface registers */
 	MPC_REGION_OVERRIDE_INIT(0x48000000, 0x48100000, 0, 0),
+
+	MPC_REGION_OVERRIDE_INIT(0x28000000, 0x28400000, 0, 0),
 #endif
 };
 
 static const struct mpc_region_override mpc03_region_overrides[] = {
 	/* Make RAM_02 (AMBIX03) accessible to the Wi-Fi domain for IPC */
-	MPC_REGION_OVERRIDE_INIT(0x200C0000, 0x200E0000, 0, 0),
+	MPC_REGION_OVERRIDE_INIT(0x200C0000, 0x200FE000, 0, 0),
 };
 
 static void set_mpc_region_override(NRF_MPC_Type *mpc,
@@ -159,15 +168,95 @@ static void grtc_configuration(void)
 
 #if defined(CONFIG_SOC_NRF71_WIFI_BOOT)
 #if !defined(CONFIG_TRUSTED_EXECUTION_NONSECURE) || defined(__NRF_TFM__)
+
+#define WICR_BASE                	DT_REG_ADDR(DT_NODELABEL(wicr))
+#define MRAM_CONFIGNVR_WICR_PAGE 	0
+
+/**
+ * Default weak implementations return the Wi-Fi ROM entry points. Out-of-tree
+ * modules that ship Wi-Fi ROM patches override these with strong definitions
+ * returning the patch addresses for the loaded firmware.
+ */
+__weak uint32_t soc_nrf71_wifi_lmac_patch_addr(void)
+{
+	return DT_REG_ADDR(DT_NODELABEL(wifi_lmac_rom_entry));
+}
+
+__weak uint32_t soc_nrf71_wifi_umac_patch_addr(void)
+{
+	return DT_REG_ADDR(DT_NODELABEL(wifi_umac_rom_entry));
+}
+
 static void wifi_setup(void)
 {
-	/* Kickstart the LMAC processor */
+#if defined(CONFIG_SOC_NRF71_WIFI_DAP)
+	/* Allow the Wi-Fi VPRs to drive UARTE30 (P0.5) for debug output. */
+#define UARTE30_PERIPH_ID ((NRF_UARTE30_S_BASE >> 12) & 0x1F)
+	NRF_SPU30->PERIPH[UARTE30_PERIPH_ID].PERM =
+		(SPU_PERIPH_PERM_SECATTR_NonSecure << SPU_PERIPH_PERM_SECATTR_Pos);
+	NRF_SPU30->FEATURE.GPIO[0].PIN[5] =
+		(SPU_FEATURE_GPIO_PIN_SECATTR_NonSecure << SPU_FEATURE_GPIO_PIN_SECATTR_Pos);
+#undef UARTE30_PERIPH_ID
+#endif /* CONFIG_SOC_NRF71_WIFI_DAP */
+
+	/* Program WICR fields from DT, but only when a value has changed.
+	 * WICR lives in MRAM CONFIGNVR which is non-volatile: once correctly
+	 * programmed the values survive resets.  Skipping unchanged writes
+	 * avoids unnecessary MRAM wear — the writes below execute on the
+	 * first boot after a DFU update (when the new image carries new
+	 * patch addresses) and are no-ops on every subsequent boot.
+	 */
+#define WICR_WRITE_IF_CHANGED(_off, _val)					\
+	do {									\
+		uint32_t _v = (uint32_t)(_val);					\
+		if (*(volatile uint32_t *)(WICR_BASE + (_off)) != _v) {		\
+			if (!_opened) {						\
+				nrfx_mramc_confignvr_perm_set(true,		\
+					MRAM_CONFIGNVR_WICR_PAGE);		\
+				_opened = true;					\
+			}							\
+			*(volatile uint32_t *)(WICR_BASE + (_off)) = _v;	\
+		}								\
+	} while (0)
+
+	bool _opened = false;
+
+	/* Firmware entry points */
+	WICR_WRITE_IF_CHANGED(0x000,
+		DT_REG_ADDR(DT_PHANDLE(DT_NODELABEL(wicr), firmware_lmacinitpc)));
+	WICR_WRITE_IF_CHANGED(0x004,
+		DT_REG_ADDR(DT_PHANDLE(DT_NODELABEL(wicr), firmware_umacinitpc)));
+
+	/* ROM patch addresses — change on every DFU that updates the patches */
+	WICR_WRITE_IF_CHANGED(0x008, soc_nrf71_wifi_lmac_patch_addr());
+	WICR_WRITE_IF_CHANGED(0x00C, soc_nrf71_wifi_umac_patch_addr());
+
+	/* IPC mailbox configuration */
+	WICR_WRITE_IF_CHANGED(0x080,
+		DT_REG_ADDR(DT_PHANDLE(DT_NODELABEL(wicr), ipcconfig_commandmbox)));
+	WICR_WRITE_IF_CHANGED(0x084,
+		DT_REG_SIZE(DT_PHANDLE(DT_NODELABEL(wicr), ipcconfig_commandmbox)));
+	WICR_WRITE_IF_CHANGED(0x088,
+		DT_REG_ADDR(DT_PHANDLE(DT_NODELABEL(wicr), ipcconfig_eventmbox)));
+	WICR_WRITE_IF_CHANGED(0x08C,
+		DT_REG_SIZE(DT_PHANDLE(DT_NODELABEL(wicr), ipcconfig_eventmbox)));
+	WICR_WRITE_IF_CHANGED(0x090,
+		DT_REG_ADDR(DT_PHANDLE(DT_NODELABEL(wicr), ipcconfig_sparembox)));
+	WICR_WRITE_IF_CHANGED(0x094,
+		DT_REG_SIZE(DT_PHANDLE(DT_NODELABEL(wicr), ipcconfig_sparembox)));
+
+	if (_opened) {
+		nrfx_mramc_confignvr_perm_set(false, MRAM_CONFIGNVR_WICR_PAGE);
+	}
+
+#undef WICR_WRITE_IF_CHANGED
+
 	NRF_WIFICORE_LRCCONF_LRC0->POWERON =
 		(LRCCONF_POWERON_MAIN_AlwaysOn << LRCCONF_POWERON_MAIN_Pos);
 	NRF_WIFICORE_LMAC_VPR->INITPC = NRF_WICR->RESERVED[0];
 	NRF_WIFICORE_LMAC_VPR->CPURUN = (VPR_CPURUN_EN_Running << VPR_CPURUN_EN_Pos);
-#endif
 }
+#endif
 #endif
 
 void soc_early_init_hook(void)
